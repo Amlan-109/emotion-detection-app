@@ -1,0 +1,6 @@
+tensorflow
+fer
+opencv-python
+facenet-pytorch
+Pillow
+numpy
