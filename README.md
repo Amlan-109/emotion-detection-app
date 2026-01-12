@@ -19,7 +19,7 @@ An advanced emotion detection application built with Python, Tkinter, and OpenCV
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/emotion-detection-app.git
+   git clone https://github.com/Amlan-109/emotion-detection-app.git
    cd emotion-detection-app
    ```
 

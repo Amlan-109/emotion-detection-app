@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import messagebox, filedialog
+from tkinter import messagebox, filedialog, simpledialog
 import cv2
 from PIL import Image, ImageTk
 try:
@@ -7,6 +7,201 @@ try:
 except ImportError:
     from fer.fer import FER
 import threading
+import pickle
+import numpy as _np
+# Try to import facenet-pytorch and torchvision transforms; allow fallback
+try:
+    from facenet_pytorch import InceptionResnetV1
+    import torchvision.transforms as transforms
+    _FACENET_AVAILABLE = True
+except Exception:
+    InceptionResnetV1 = None
+    transforms = None
+    _FACENET_AVAILABLE = False
+
+import os
+
+class SecurityManager:
+    """Inline security manager using facenet-pytorch embeddings.
+
+    If facenet-pytorch isn't available, recognition methods will return None.
+    """
+    def __init__(self, authorized_dir=None, emb_file="embeddings.pkl", device=None):
+        self.authorized_dir = authorized_dir or os.path.join(os.path.dirname(__file__), "authorized")
+        os.makedirs(self.authorized_dir, exist_ok=True)
+        self.emb_file = os.path.join(self.authorized_dir, emb_file)
+        self.embeddings = {}
+        self.model = None
+        self.transform = None
+        if _FACENET_AVAILABLE and InceptionResnetV1 is not None:
+            try:
+                self.model = InceptionResnetV1(pretrained='vggface2').eval()
+                self.transform = transforms.Compose([
+                    transforms.Resize((160,160)),
+                    transforms.ToTensor(),
+                    transforms.Normalize([0.5,0.5,0.5],[0.5,0.5,0.5])
+                ])
+            except Exception:
+                self.model = None
+                self.transform = None
+        self._load_embeddings()
+
+    def _load_embeddings(self):
+        if os.path.exists(self.emb_file):
+            try:
+                with open(self.emb_file, "rb") as f:
+                    self.embeddings = pickle.load(f)
+            except Exception:
+                self.embeddings = {}
+
+    def _save_embeddings(self):
+        try:
+            with open(self.emb_file, "wb") as f:
+                pickle.dump(self.embeddings, f)
+        except Exception:
+            pass
+
+    def _pil_from_bgr(self, arr):
+        if arr is None:
+            return None
+        import cv2
+        from PIL import Image as _PILImage
+        rgb = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+        return _PILImage.fromarray(rgb)
+
+    def _get_embedding(self, face_bgr):
+        # Prefer using torchvision transforms + PIL (when available), but
+        # fall back to manual OpenCV->numpy->torch conversion on failure.
+        try:
+            if self.model is None:
+                return None
+            # Try torchvision path first
+            if self.transform is not None:
+                try:
+                    img = self._pil_from_bgr(face_bgr)
+                    if img is None:
+                        return None
+                    x = self.transform(img).unsqueeze(0)
+                    import torch
+                    with torch.no_grad():
+                        e = self.model(x).cpu().numpy()[0]
+                    e = _np.asarray(e)
+                    e = e / (_np.linalg.norm(e) + 1e-10)
+                    return e
+                except Exception:
+                    # fallback to manual path
+                    pass
+
+            # Manual fallback: resize with OpenCV, convert to float tensor
+            try:
+                import cv2
+                import torch
+                arr = face_bgr
+                if arr is None:
+                    return None
+                # ensure color and size
+                arr_rgb = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+                arr_rgb = cv2.resize(arr_rgb, (160, 160), interpolation=cv2.INTER_CUBIC)
+                arr_f = arr_rgb.astype(_np.float32) / 255.0
+                # normalize to [-1,1]
+                arr_f = (arr_f - 0.5) / 0.5
+                tensor = torch.from_numpy(arr_f).permute(2, 0, 1).unsqueeze(0)
+                with torch.no_grad():
+                    e = self.model(tensor).cpu().numpy()[0]
+                e = _np.asarray(e)
+                e = e / (_np.linalg.norm(e) + 1e-10)
+                return e
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def enroll_from_folder(self, name, folder_path):
+        from PIL import Image
+        import cv2
+        embs = []
+        report = {
+            'folder': folder_path,
+            'total_files': 0,
+            'files_opened': 0,
+            'embeddings_generated': 0,
+            'failed_files': []
+        }
+        for fn in os.listdir(folder_path):
+            p = os.path.join(folder_path, fn)
+            if not os.path.isfile(p):
+                continue
+            report['total_files'] += 1
+            try:
+                # Use PIL to robustly open many image formats (RGBA, P, GIF, TIFF, etc.)
+                with Image.open(p) as im:
+                    # If animated (multiple frames), take the first frame
+                    try:
+                        im.seek(0)
+                    except Exception:
+                        pass
+                    # Convert any mode to RGB (handles L, RGBA, P, CMYK)
+                    im = im.convert("RGB")
+                    arr = _np.asarray(im)
+                    # Convert RGB (PIL) -> BGR (OpenCV) expected by _get_embedding
+                    img = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+                report['files_opened'] += 1
+            except Exception as ex:
+                report['failed_files'].append((fn, str(ex)))
+                continue
+            emb = self._get_embedding(img)
+            if emb is not None:
+                embs.append(emb)
+        report['embeddings_generated'] = len(embs)
+        self.last_enroll_report = report
+        if not embs:
+            return False
+        # store multiple embeddings: keep list per person
+        try:
+            cur = self.embeddings.get(name, [])
+            if not isinstance(cur, list):
+                cur = [cur]
+            cur.extend(embs)
+            self.embeddings[name] = cur
+            self._save_embeddings()
+            return True
+        except Exception:
+            return False
+
+    def load_authorized(self):
+        for name in os.listdir(self.authorized_dir):
+            p = os.path.join(self.authorized_dir, name)
+            if os.path.isdir(p) and name not in self.embeddings:
+                try:
+                    self.enroll_from_folder(name, p)
+                except Exception:
+                    pass
+
+    def recognize(self, face_bgr, threshold=0.6):
+        if not self.embeddings or self.model is None:
+            return None, 0.0
+        emb = self._get_embedding(face_bgr)
+        if emb is None:
+            return None, 0.0
+        best_name = None
+        best_sim = -1.0
+        for name, ref in self.embeddings.items():
+            # support list of embeddings per person
+            if isinstance(ref, list) or isinstance(ref, tuple):
+                for r in ref:
+                    sim = float(_np.dot(emb, r) / (_np.linalg.norm(emb) * (_np.linalg.norm(r) + 1e-10)))
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_name = name
+            else:
+                r = ref
+                sim = float(_np.dot(emb, r) / (_np.linalg.norm(emb) * (_np.linalg.norm(r) + 1e-10)))
+                if sim > best_sim:
+                    best_sim = sim
+                    best_name = name
+        if best_sim >= threshold:
+            return best_name, best_sim
+        return None, best_sim
 import os
 from datetime import datetime
 import numpy as np
@@ -18,6 +213,44 @@ from concurrent.futures import ThreadPoolExecutor
 # Initialize the emotion detection model
 emotion_detector_haar = FER(mtcnn=False)
 emotion_detector_mtcnn = FER(mtcnn=True)
+
+# Initialize security manager (face recognition)
+secmgr = None
+if SecurityManager is not None:
+    try:
+        secmgr = SecurityManager()
+        secmgr.load_authorized()
+    except Exception:
+        secmgr = None
+
+def trigger_alarm(duration=2.0, freq=1000):
+    """Play a short alarm beep in background (Windows winsound if available)."""
+    def _alarm():
+        end = time.time() + duration
+        try:
+            import winsound
+            while time.time() < end:
+                winsound.Beep(freq, 300)
+                time.sleep(0.1)
+        except Exception:
+            # Fallback: rapid console output so there's at least some indication
+            try:
+                import sys
+                sys.stdout.write('\a')
+                sys.stdout.flush()
+            except Exception:
+                pass
+    threading.Thread(target=_alarm, daemon=True).start()
+
+def log_imposter_event(saved_path, score):
+    try:
+        logdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_emotions")
+        os.makedirs(logdir, exist_ok=True)
+        logfile = os.path.join(logdir, "alerts.log")
+        with open(logfile, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat()} IMPROPER_ACCESS {os.path.basename(saved_path)} score={score:.3f}\n")
+    except Exception:
+        pass
 
 # Global variables for camera feed and current frame
 cap = None
@@ -71,9 +304,20 @@ class Track:
         self.smoother = EmotionSmoother(alpha=0.6, keys=list(EMOJI_MAP.keys()))
         self.last_emotion = None
         self.last_score = 0.0
+        # recognition state
+        self.recognized_name = None
+        self.recognized_score = 0.0
+        # count consecutive frames seen as unknown
+        self.unknown_count = 0
+        self.last_seen_ts = time.time()
+        self.alerted = False
 
 tracks = {}
 next_track_id = 1
+
+# Security tuning parameters (can be changed from Security UI)
+security_threshold_var = None
+security_unknown_limit_var = None
 
 def open_camera():
     global cap
@@ -127,8 +371,61 @@ def threaded_emotion_detection(frame):
             for k, v in probs.items():
                 aggregate[k] += v
             x, y, w, h = box
-            cv2.rectangle(img_annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            # recognition + robust imposter handling
+            rect_col = (0, 255, 0)
             label = f"ID{tid_match}:{dom}:{score:.2f}"
+            # read security params before recognition
+            thresh, unknown_limit = get_security_params()
+            try:
+                if secmgr is not None:
+                    face_roi = img_bgr[y:y+h, x:x+w].copy()
+                    recognized_name, recognized_score = secmgr.recognize(face_roi, threshold=thresh)
+                else:
+                    recognized_name, recognized_score = None, 0.0
+            except Exception:
+                recognized_name, recognized_score = None, 0.0
+
+            thresh, unknown_limit = get_security_params()
+            if recognized_name:
+                tr.recognized_name = recognized_name
+                tr.recognized_score = recognized_score
+                tr.unknown_count = 0
+                tr.alerted = False
+                label = f"{recognized_name}:{recognized_score:.2f}"
+                rect_col = (0, 200, 0)
+            else:
+                # Increase unknown count and check threshold for imposter
+                tr.unknown_count = (tr.unknown_count or 0) + 1
+                tr.last_seen_ts = time.time()
+                # recognized_score may hold best_sim even when name is None
+                if tr.unknown_count >= max(1, unknown_limit):
+                    # mark as imposter once
+                    if not getattr(tr, 'alerted', False):
+                        tr.alerted = True
+                        rect_col = (0, 0, 255)
+                        label = f"IMPOSTER ({recognized_score:.2f})"
+                        # save snapshot and log
+                        try:
+                            def _save_and_alarm_imp():
+                                try:
+                                    savedir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_emotions")
+                                    os.makedirs(savedir, exist_ok=True)
+                                    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                                    fname = f"imposter_ID{tid_match}_{ts}.jpg"
+                                    fp = os.path.join(savedir, fname)
+                                    cv2.imwrite(fp, img_bgr)
+                                    log_imposter_event(fp, recognized_score)
+                                except Exception:
+                                    pass
+                                trigger_alarm()
+                            threading.Thread(target=_save_and_alarm_imp, daemon=True).start()
+                        except Exception:
+                            pass
+                else:
+                    label = f"Unknown:{recognized_score:.2f}"
+                    rect_col = (0, 180, 180)
+
+            cv2.rectangle(img_annotated, (x, y), (x + w, y + h), rect_col, 2)
             tx = x + w//2 - 75
             ty = max(0, y - 24)
             cv2.rectangle(img_annotated, (tx, ty), (tx + 150, ty + 22), (0, 0, 0), -1)
@@ -615,36 +912,299 @@ def close_camera():
 def open_emotion_detection_app():
     # Hide the login window
     login_frame.pack_forget()
-
     # Show the main menu
     show_main_menu()
 
+def hide_all_frames():
+    """Hide all top-level app frames so only the target frame is visible."""
+    for f in [login_frame, main_menu_frame, camera_frame, image_scan_frame, security_frame]:
+        try:
+            f.pack_forget()
+        except Exception:
+            pass
+
 # Function to show the main menu
 def show_main_menu():
-    # Hide other frames
-    camera_frame.pack_forget()
-    image_scan_frame.pack_forget()
-    
-    # Show the main menu frame
+    hide_all_frames()
     main_menu_frame.pack(fill="both", expand=True)
 
 # Function to show the camera section
 def show_camera_section():
-    # Hide other frames
-    main_menu_frame.pack_forget()
-    image_scan_frame.pack_forget()
-    
-    # Show the camera frame
+    hide_all_frames()
     camera_frame.pack(fill="both", expand=True)
 
 # Function to show the image scanning section
 def show_image_scan_section():
-    # Hide other frames
-    main_menu_frame.pack_forget()
-    camera_frame.pack_forget()
-    
-    # Show the image scan frame
+    hide_all_frames()
     image_scan_frame.pack(fill="both", expand=True)
+
+def show_security_section():
+    hide_all_frames()
+    security_frame.pack(fill="both", expand=True)
+
+def enroll_from_folder_ui():
+    if secmgr is None:
+        messagebox.showerror("Error", "Security manager not available (missing dependencies).")
+        return
+    name = simpledialog.askstring("Enroll Person", "Enter person name:")
+    if not name:
+        return
+    folder = filedialog.askdirectory(title=f"Select images folder for {name}")
+    if not folder:
+        return
+    try:
+        ok = secmgr.enroll_from_folder(name, folder)
+        # show detailed report if available
+        rpt = getattr(secmgr, 'last_enroll_report', None)
+        if ok:
+            try:
+                if 'enrolled_label' in globals():
+                    enrolled_label.config(text=f"Enrolled: {len(secmgr.embeddings)}")
+            except Exception:
+                pass
+            if rpt is not None:
+                messagebox.showinfo("Enrolled", f"Person '{name}' enrolled.\nFiles: {rpt['total_files']}\nOpened: {rpt['files_opened']}\nEmbeddings: {rpt['embeddings_generated']}")
+            else:
+                messagebox.showinfo("Enrolled", f"Person '{name}' enrolled from {folder}.")
+        else:
+            if rpt is not None:
+                fail_msg = f"No embeddings created. Files scanned: {rpt['total_files']}. Opened: {rpt['files_opened']}."
+                if rpt['failed_files']:
+                    sample = rpt['failed_files'][:5]
+                    fail_msg += "\nFailed files: " + ", ".join([n for n,_ in sample])
+                messagebox.showerror("Failed", fail_msg)
+            else:
+                messagebox.showerror("Failed", "No valid images found or embedding failed.")
+    except Exception as e:
+        messagebox.showerror("Error", f"Enrollment failed: {e}")
+
+def load_authorized_ui():
+    if secmgr is None:
+        messagebox.showerror("Error", "Security manager not available.")
+        return
+    secmgr.load_authorized()
+    # update enrolled label if available
+    try:
+        if 'enrolled_label' in globals():
+            enrolled_label.config(text=f"Enrolled: {len(secmgr.embeddings)}")
+    except Exception:
+        pass
+    messagebox.showinfo("Loaded", "Authorized folders scanned and embeddings loaded.")
+
+def list_authorized_ui():
+    if secmgr is None:
+        messagebox.showerror("Error", "Security manager not available.")
+        return
+    names = list(secmgr.embeddings.keys())
+    if not names:
+        messagebox.showinfo("Authorized", "No authorized people enrolled.")
+        return
+    messagebox.showinfo("Authorized", "\n".join(names))
+
+def remove_authorized_ui():
+    if secmgr is None:
+        messagebox.showerror("Error", "Security manager not available.")
+        return
+    name = simpledialog.askstring("Remove Person", "Enter person name to remove:")
+    if not name:
+        return
+    if name in secmgr.embeddings:
+        del secmgr.embeddings[name]
+        secmgr._save_embeddings()
+        messagebox.showinfo("Removed", f"Removed '{name}' from authorized list.")
+    else:
+        messagebox.showerror("Not found", f"'{name}' is not enrolled.")
+
+def test_current_frame_ui():
+    if secmgr is None:
+        messagebox.showerror("Error", "Security manager not available.")
+        return
+    if current_frame is None:
+        messagebox.showerror("Error", "No current frame. Start camera first.")
+        return
+    # prefer current tracked faces
+    if tracks:
+        tid, tr = next(iter(tracks.items()))
+        x, y, w, h = tr.box
+        try:
+            face = current_frame[y:y+h, x:x+w].copy()
+        except Exception:
+            messagebox.showerror("Error", "Failed to crop face from frame.")
+            return
+        name, score = secmgr.recognize(face)
+        if name:
+            messagebox.showinfo("Recognized", f"{name} ({score:.2f})")
+        else:
+            messagebox.showinfo("Unknown", f"No match (best score {score:.2f})")
+    else:
+        messagebox.showerror("Error", "No faces tracked yet. Ensure someone is in frame.")
+
+def get_security_params():
+    try:
+        thresh = float(security_threshold_var.get()) if security_threshold_var is not None else 0.6
+    except Exception:
+        thresh = 0.6
+    try:
+        limit = int(security_unknown_limit_var.get()) if security_unknown_limit_var is not None else 5
+    except Exception:
+        limit = 5
+    return thresh, limit
+
+def enroll_from_camera_ui():
+    if secmgr is None:
+        messagebox.showerror("Error", "Security manager not available (missing dependencies).")
+        return
+    name = simpledialog.askstring("Enroll From Camera", "Enter person name:")
+    if not name:
+        return
+    samples = simpledialog.askinteger("Samples", "Number of samples to capture:", initialvalue=10, minvalue=3, maxvalue=50)
+    if not samples:
+        return
+    # Ensure camera is open and visible for user feedback
+    try:
+        open_camera()
+        show_camera_section()
+    except Exception:
+        pass
+    # Give a short moment for frames to start arriving
+    time.sleep(0.2)
+    # start background capture
+    threading.Thread(target=_enroll_from_camera_thread, args=(name, samples), daemon=True).start()
+
+def _enroll_from_camera_thread(name, samples):
+    # Try to use live `current_frame` if camera already running, else open temporary capture
+    use_temp_cap = False
+    cap_local = None
+    try:
+        if 'cap' in globals() and cap is not None and cap.isOpened():
+            cap_local = None
+        else:
+            cap_local = cv2.VideoCapture(0)
+            use_temp_cap = True
+    except Exception:
+        cap_local = None
+        use_temp_cap = False
+
+    # quick check: ensure embedding model exists
+    if getattr(secmgr, 'model', None) is None:
+        root.after(0, lambda: messagebox.showerror("Error", "Face embedding model not available. Ensure torch/facenet-pytorch are installed and compatible."))
+        return
+
+    collected = 0
+    embeddings = []
+    savedir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "authorized", name)
+    os.makedirs(savedir, exist_ok=True)
+    failures = []
+    attempts = 0
+    max_attempts = samples * 10
+    while collected < samples and attempts < max_attempts:
+        attempts += 1
+        # get frame
+        frame = None
+        if cap_local is not None and use_temp_cap:
+            ret, f = cap_local.read()
+            if not ret:
+                time.sleep(0.2)
+                continue
+            frame = f
+        else:
+            # use shared current_frame
+            frame = globals().get('current_frame', None)
+            if frame is None:
+                time.sleep(0.2)
+                continue
+
+        try:
+            if frame is None:
+                time.sleep(0.1)
+                continue
+            img_bgr = prepare_for_detection(frame.copy())
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            results = detect_emotions_with_fallback(img_rgb)
+            if not results:
+                time.sleep(0.2)
+                continue
+            # pick largest face
+            best = max(results, key=lambda r: r['box'][2]*r['box'][3])
+            x, y, w, h = best['box']
+            # expand box slightly
+            pad = int(0.2 * max(w, h))
+            x0 = max(0, x - pad)
+            y0 = max(0, y - pad)
+            x1 = min(img_bgr.shape[1], x + w + pad)
+            y1 = min(img_bgr.shape[0], y + h + pad)
+            face = img_bgr[y0:y1, x0:x1].copy()
+            # compute embedding
+            emb = None
+            try:
+                emb = secmgr._get_embedding(face)
+            except Exception:
+                emb = None
+            if emb is not None:
+                embeddings.append(emb)
+                # save sample image
+                try:
+                    fn = os.path.join(savedir, f"sample_{collected+1}.jpg")
+                    cv2.imwrite(fn, face)
+                except Exception:
+                    pass
+                collected += 1
+                # update UI
+                try:
+                    root.after(0, lambda c=collected, s=samples: lbl_sec_status.config(text=f"Captured {c}/{s} samples"))
+                except Exception:
+                    pass
+            else:
+                failures.append('no_emb')
+            time.sleep(0.4)
+        except Exception as e:
+            failures.append(str(e))
+            time.sleep(0.2)
+
+    # close temp cap if used
+    try:
+        if cap_local is not None and use_temp_cap:
+            cap_local.release()
+    except Exception:
+        pass
+
+    # save embeddings to manager
+    added = 0
+    if embeddings:
+        try:
+            cur = secmgr.embeddings.get(name, [])
+            if not isinstance(cur, list):
+                cur = [cur]
+            cur.extend(embeddings)
+            secmgr.embeddings[name] = cur
+            secmgr._save_embeddings()
+            added = len(embeddings)
+        except Exception:
+            added = 0
+
+    # update enrolled label
+    try:
+        root.after(0, lambda: enrolled_label.config(text=f"Enrolled: {len(secmgr.embeddings)}"))
+    except Exception:
+        pass
+
+    # final dialog
+    if added > 0:
+        root.after(0, lambda: messagebox.showinfo("Enrolled", f"Captured {added} embeddings for {name}."))
+    else:
+        msg = f"No embeddings captured for {name}. Attempts: {attempts}."
+        if failures:
+            msg += " Check camera or image quality."
+        root.after(0, lambda: messagebox.showerror("Failed", msg))
+
+def open_security_camera():
+    """Open the main camera and switch to camera view so security detection runs."""
+    # Start camera (if not running) and navigate to camera section
+    try:
+        open_camera()
+    except Exception:
+        pass
+    show_camera_section()
 
 # Function to handle user login
 def login():
@@ -661,9 +1221,7 @@ def login():
 # Function to go back to the login page
 def go_back_to_login():
     # Hide all frames
-    main_menu_frame.pack_forget()
-    camera_frame.pack_forget()
-    image_scan_frame.pack_forget()
+    hide_all_frames()
     
     # Close camera if open
     close_camera()
@@ -673,15 +1231,12 @@ def go_back_to_login():
 
 # Function to go back to the main menu
 def go_back_to_main_menu():
-    # Hide current frame
-    if camera_frame.winfo_ismapped():
-        # Close camera if open
+    # Hide current frame and show main menu
+    try:
         close_camera()
-        camera_frame.pack_forget()
-    elif image_scan_frame.winfo_ismapped():
-        image_scan_frame.pack_forget()
-    
-    # Show the main menu
+    except Exception:
+        pass
+    hide_all_frames()
     show_main_menu()
 
 # Keyboard and quick control helpers
@@ -752,6 +1307,10 @@ btn_camera_section.pack(pady=15)
 btn_image_scan_section = tk.Button(main_menu_frame, text="Scan Image for Emotions", font=("Arial", 14), 
                                   command=show_image_scan_section, bg='#2196F3', fg='white', width=25, height=2)
 btn_image_scan_section.pack(pady=15)
+
+btn_security_section = tk.Button(main_menu_frame, text="Security Management", font=("Arial", 14),
+                                 command=show_security_section, bg='#607D8B', fg='white', width=25, height=2)
+btn_security_section.pack(pady=15)
 
 btn_main_logout = tk.Button(main_menu_frame, text="Logout", font=("Arial", 14), 
                            command=go_back_to_login, bg='#f44336', fg='white', width=15)
@@ -845,6 +1404,68 @@ btn_save_scanned_image.pack(side="left", padx=10)
 # Back button to go to the main menu from image scanning section
 btn_scan_back = tk.Button(image_scan_frame, text="Back to Menu", font=("Arial", 14), command=go_back_to_main_menu, bg='#FFA500', fg='white')
 btn_scan_back.pack(pady=20)
+
+# Security management UI
+security_frame = tk.Frame(root, bg='#f2f2f2')
+
+lbl_sec_title = tk.Label(security_frame, text="Security Management", font=("Arial", 24), bg='#f2f2f2', fg='#333')
+lbl_sec_title.pack(pady=20)
+
+lbl_sec_description = tk.Label(security_frame, text="Manage authorized people and test recognition.", font=("Arial", 14), bg='#f2f2f2', fg='#666')
+lbl_sec_description.pack(pady=10)
+
+sec_buttons_frame = tk.Frame(security_frame, bg='#f2f2f2')
+sec_buttons_frame.pack(pady=20)
+
+btn_enroll_folder = tk.Button(sec_buttons_frame, text="Enroll From Folder", font=("Arial", 12), command=enroll_from_folder_ui, bg='#4CAF50', fg='white')
+btn_enroll_folder.pack(side='left', padx=8)
+
+btn_enroll_camera = tk.Button(sec_buttons_frame, text="Enroll From Camera", font=("Arial", 12), command=lambda: enroll_from_camera_ui(), bg='#3EA055', fg='white')
+btn_enroll_camera.pack(side='left', padx=8)
+
+btn_load_authorized = tk.Button(sec_buttons_frame, text="Load Authorized", font=("Arial", 12), command=load_authorized_ui, bg='#2196F3', fg='white')
+btn_load_authorized.pack(side='left', padx=8)
+
+btn_list_authorized = tk.Button(sec_buttons_frame, text="List Authorized", font=("Arial", 12), command=list_authorized_ui, bg='#9C27B0', fg='white')
+btn_list_authorized.pack(side='left', padx=8)
+
+btn_remove_authorized = tk.Button(sec_buttons_frame, text="Remove Authorized", font=("Arial", 12), command=remove_authorized_ui, bg='#f44336', fg='white')
+btn_remove_authorized.pack(side='left', padx=8)
+
+btn_test_frame = tk.Button(security_frame, text="Test Current Frame", font=("Arial", 14), command=test_current_frame_ui, bg='#795548', fg='white')
+btn_test_frame.pack(pady=10)
+
+btn_open_sec_camera = tk.Button(security_frame, text="Open Camera (Security)", font=("Arial", 14), command=open_security_camera, bg='#4CAF50', fg='white')
+btn_open_sec_camera.pack(pady=6)
+
+# Security settings
+settings_frame = tk.Frame(security_frame, bg='#f2f2f2')
+settings_frame.pack(pady=6)
+
+# Threshold for recognition (0..1)
+security_threshold_var = tk.DoubleVar(value=0.6)
+lbl_thresh = tk.Label(settings_frame, text="Recognition threshold:", bg='#f2f2f2')
+lbl_thresh.pack(side='left', padx=(0,6))
+spin_thresh = tk.Spinbox(settings_frame, from_=0.1, to=0.99, increment=0.01, textvariable=security_threshold_var, width=6)
+spin_thresh.pack(side='left', padx=(0,12))
+
+# Unknown frames until alarm
+security_unknown_limit_var = tk.IntVar(value=5)
+lbl_limit = tk.Label(settings_frame, text="Unknown frames to alert:", bg='#f2f2f2')
+lbl_limit.pack(side='left', padx=(0,6))
+spin_limit = tk.Spinbox(settings_frame, from_=1, to=30, textvariable=security_unknown_limit_var, width=4)
+spin_limit.pack(side='left', padx=(0,12))
+
+# Enrolled count
+enrolled_label = tk.Label(security_frame, text="Enrolled: 0", bg='#f2f2f2', fg='#333')
+enrolled_label.pack(pady=(6,0))
+
+lbl_sec_status = tk.Label(security_frame, text="", bg='#f2f2f2', fg='#333')
+lbl_sec_status.pack(pady=(4,0))
+
+
+btn_sec_back = tk.Button(security_frame, text="Back to Menu", font=("Arial", 14), command=go_back_to_main_menu, bg='#FFA500', fg='white')
+btn_sec_back.pack(pady=20)
 
 # Initially show the login frame
 login_frame.pack()
