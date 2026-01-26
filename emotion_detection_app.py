@@ -168,6 +168,73 @@ class SecurityManager:
         except Exception:
             return False
 
+    def enroll_from_image(self, name, image_path):
+        from PIL import Image
+        import cv2
+        import time as _time
+        report = {
+            'file': image_path,
+            'total_files': 1,
+            'files_opened': 0,
+            'embeddings_generated': 0,
+            'failed_files': [],
+            'error_details': []
+        }
+        if not image_path or not os.path.isfile(image_path):
+            report['error_details'].append("Invalid image path or file does not exist")
+            self.last_enroll_report = report
+            return False
+        try:
+            with Image.open(image_path) as im:
+                try:
+                    im.seek(0)
+                except Exception:
+                    pass
+                im = im.convert("RGB")
+                arr = _np.asarray(im)
+                img = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            report['files_opened'] = 1
+        except Exception as ex:
+            report['failed_files'].append((os.path.basename(image_path), str(ex)))
+            report['error_details'].append(f"Image processing failed: {str(ex)}")
+            self.last_enroll_report = report
+            return False
+        try:
+            emb = self._get_embedding(img)
+        except Exception as ex:
+            report['error_details'].append(f"Embedding creation failed: {str(ex)}")
+            self.last_enroll_report = report
+            return False
+        if emb is None:
+            report['error_details'].append("Embedding is None - check if face detection model is loaded properly")
+            self.last_enroll_report = report
+            return False
+        report['embeddings_generated'] = 1
+        self.last_enroll_report = report
+        try:
+            cur = self.embeddings.get(name, [])
+            if not isinstance(cur, list):
+                cur = [cur]
+            cur.append(emb)
+            self.embeddings[name] = cur
+            # Save the source image into the authorized folder for traceability
+            try:
+                savedir = os.path.join(self.authorized_dir, name)
+                os.makedirs(savedir, exist_ok=True)
+                base = os.path.basename(image_path)
+                dst = os.path.join(savedir, base)
+                if os.path.exists(dst):
+                    root, ext = os.path.splitext(base)
+                    dst = os.path.join(savedir, f"{root}_{int(_time.time())}{ext}")
+                cv2.imwrite(dst, img)
+            except Exception as save_ex:
+                report['error_details'].append(f"Image save failed (non-critical): {str(save_ex)}")
+            self._save_embeddings()
+            return True
+        except Exception as ex:
+            report['error_details'].append(f"Database save failed: {str(ex)}")
+            return False
+
     def load_authorized(self):
         for name in os.listdir(self.authorized_dir):
             p = os.path.join(self.authorized_dir, name)
@@ -242,6 +309,24 @@ def trigger_alarm(duration=2.0, freq=1000):
                 pass
     threading.Thread(target=_alarm, daemon=True).start()
 
+def trigger_ok():
+    """Play a short OK tone sequence once (non-blocking)."""
+    def _ok():
+        try:
+            import winsound
+            # pleasant two-tone acknowledgement
+            winsound.Beep(750, 150)
+            time.sleep(0.05)
+            winsound.Beep(1000, 120)
+        except Exception:
+            try:
+                import sys
+                sys.stdout.write('\a')
+                sys.stdout.flush()
+            except Exception:
+                pass
+    threading.Thread(target=_ok, daemon=True).start()
+
 def log_imposter_event(saved_path, score):
     try:
         logdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_emotions")
@@ -261,9 +346,10 @@ current_emotion_score = 0
 emotion_history = []
 last_annotated_bgr = None
 after_job_id = None
+current_video_label = None
 
 class EmotionSmoother:
-    def __init__(self, alpha=0.6, keys=None):
+    def __init__(self, alpha=0.8, keys=None):
         self.alpha = alpha
         self.keys = keys or ["happy", "sad", "angry", "surprise"]
         self.smoothed = {}
@@ -326,9 +412,9 @@ def open_camera():
         messagebox.showerror("Error", "Failed to open the camera.")
         return
 
-    # Set a lower resolution
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    # Set a higher resolution for better accuracy
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
     update_frame()
 
@@ -387,11 +473,21 @@ def threaded_emotion_detection(frame):
 
             thresh, unknown_limit = get_security_params()
             if recognized_name:
+                # If a different person is now recognized, reset ok state
+                if getattr(tr, 'recognized_name', None) != recognized_name:
+                    tr.oked = False
                 tr.recognized_name = recognized_name
                 tr.recognized_score = recognized_score
                 tr.unknown_count = 0
                 tr.alerted = False
-                label = f"{recognized_name}:{recognized_score:.2f}"
+                # Play a single OK tone when first recognized to acknowledge authorized person
+                if not getattr(tr, 'oked', False):
+                    tr.oked = True
+                    try:
+                        trigger_ok()
+                    except Exception:
+                        pass
+                label = f"Person {tid_match}: {recognized_name} - {dom}"
                 rect_col = (0, 200, 0)
             else:
                 # Increase unknown count and check threshold for imposter
@@ -403,7 +499,7 @@ def threaded_emotion_detection(frame):
                     if not getattr(tr, 'alerted', False):
                         tr.alerted = True
                         rect_col = (0, 0, 255)
-                        label = f"IMPOSTER ({recognized_score:.2f})"
+                        label = f"Person {tid_match}: IMPOSITER - {dom}"
                         # save snapshot and log
                         try:
                             def _save_and_alarm_imp():
@@ -422,7 +518,7 @@ def threaded_emotion_detection(frame):
                         except Exception:
                             pass
                 else:
-                    label = f"Unknown:{recognized_score:.2f}"
+                    label = f"Person {tid_match}: Unknown - {dom}"
                     rect_col = (0, 180, 180)
 
             cv2.rectangle(img_annotated, (x, y), (x + w, y + h), rect_col, 2)
@@ -473,13 +569,15 @@ def update_frame():
         img_rgb = cv2.cvtColor(display_bgr, cv2.COLOR_BGR2RGB)
         img_pil = Image.fromarray(img_rgb)
         imgtk = ImageTk.PhotoImage(image=img_pil)
-        lbl_video.imgtk = imgtk
-        lbl_video.configure(image=imgtk)
+        if current_video_label:
+            current_video_label.imgtk = imgtk
+            current_video_label.configure(image=imgtk)
         if detection_fut is None or detection_fut.done():
             detection_fut = executor.submit(threaded_emotion_detection, frame.copy())
         if 'lbl_status' in globals():
             lbl_status.config(text=f"Frames: {frame_counter}  FPS: {fps:.1f}")
-    after_job_id = lbl_video.after(50, update_frame)
+    if current_video_label:
+        after_job_id = current_video_label.after(50, update_frame)
 
 # Function to detect emotions in a frame
 def detect_emotion(frame):
@@ -900,12 +998,13 @@ def close_camera():
         cap = None
     if after_job_id:
         try:
-            lbl_video.after_cancel(after_job_id)
+            current_video_label.after_cancel(after_job_id)
         except Exception:
             pass
         after_job_id = None
     last_annotated_bgr = None
-    lbl_video.config(image="")
+    if current_video_label:
+        current_video_label.config(image="")
     lbl_result.config(text="Camera Closed", fg="green")
 
 # Function to display the emotion detection app after successful login
@@ -917,7 +1016,7 @@ def open_emotion_detection_app():
 
 def hide_all_frames():
     """Hide all top-level app frames so only the target frame is visible."""
-    for f in [login_frame, main_menu_frame, camera_frame, image_scan_frame, security_frame]:
+    for f in [login_frame, main_menu_frame, camera_frame, image_scan_frame, security_frame, face_recognition_frame]:
         try:
             f.pack_forget()
         except Exception:
@@ -930,8 +1029,10 @@ def show_main_menu():
 
 # Function to show the camera section
 def show_camera_section():
+    global current_video_label
     hide_all_frames()
     camera_frame.pack(fill="both", expand=True)
+    current_video_label = lbl_video
 
 # Function to show the image scanning section
 def show_image_scan_section():
@@ -941,6 +1042,45 @@ def show_image_scan_section():
 def show_security_section():
     hide_all_frames()
     security_frame.pack(fill="both", expand=True)
+
+def update_recognized_list():
+    # Clear the list
+    recognized_listbox.delete(0, tk.END)
+    # Add all tracked people, with names for recognized, IDs for unknown
+    for tid, tr in tracks.items():
+        if tr.recognized_name:
+            name = tr.recognized_name
+            score = tr.recognized_score
+            recognized_listbox.insert(tk.END, f"{name}: {score:.2f}")
+        else:
+            # For unknown, show as Person ID with unknown status
+            score = getattr(tr, 'recognized_score', 0.0) or 0.0
+            recognized_listbox.insert(tk.END, f"Person {tid}: Unknown ({score:.2f})")
+
+def show_face_recognition_section():
+    global current_video_label
+    hide_all_frames()
+    face_recognition_frame.pack(fill="both", expand=True)
+    current_video_label = lbl_face_video
+    # Start camera if not already running
+    try:
+        if not cap or not cap.isOpened():
+            open_camera()
+    except Exception:
+        pass
+    update_recognized_list()
+    # Schedule updates
+    if not hasattr(show_face_recognition_section, 'update_job'):
+        show_face_recognition_section.update_job = root.after(1000, update_recognized_list_loop)
+
+def update_recognized_list_loop():
+    if face_recognition_frame.winfo_ismapped():
+        update_recognized_list()
+        show_face_recognition_section.update_job = root.after(1000, update_recognized_list_loop)
+    else:
+        if hasattr(show_face_recognition_section, 'update_job'):
+            root.after_cancel(show_face_recognition_section.update_job)
+            delattr(show_face_recognition_section, 'update_job')
 
 def enroll_from_folder_ui():
     if secmgr is None:
@@ -975,6 +1115,38 @@ def enroll_from_folder_ui():
                 messagebox.showerror("Failed", fail_msg)
             else:
                 messagebox.showerror("Failed", "No valid images found or embedding failed.")
+    except Exception as e:
+        messagebox.showerror("Error", f"Enrollment failed: {e}")
+
+def enroll_from_image_ui():
+    """Enroll a single person from a selected image file."""
+    if secmgr is None:
+        messagebox.showerror("Error", "Security manager not available (missing dependencies).")
+        return
+    name = simpledialog.askstring("Enroll Person (Image)", "Enter person name:")
+    if not name:
+        return
+    image_path = filedialog.askopenfilename(title=f"Select image for {name}", filetypes=[("Image files", "*.jpg;*.jpeg;*.png;*.bmp")])
+    if not image_path:
+        return
+    try:
+        ok = secmgr.enroll_from_image(name, image_path)
+        rpt = getattr(secmgr, 'last_enroll_report', None)
+        if ok:
+            try:
+                if 'enrolled_label' in globals():
+                    enrolled_label.config(text=f"Enrolled: {len(secmgr.embeddings)}")
+            except Exception:
+                pass
+            if rpt is not None:
+                messagebox.showinfo("Enrolled", f"Person '{name}' enrolled from image.\nEmbeddings: {rpt['embeddings_generated']}")
+            else:
+                messagebox.showinfo("Enrolled", f"Person '{name}' enrolled from image.")
+        else:
+            error_msg = "Failed to create embedding for image."
+            if rpt and 'error_details' in rpt and rpt['error_details']:
+                error_msg += "\n\nError details:\n" + "\n".join(rpt['error_details'])
+            messagebox.showerror("Failed", error_msg)
     except Exception as e:
         messagebox.showerror("Error", f"Enrollment failed: {e}")
 
@@ -1312,7 +1484,11 @@ btn_security_section = tk.Button(main_menu_frame, text="Security Management", fo
                                  command=show_security_section, bg='#607D8B', fg='white', width=25, height=2)
 btn_security_section.pack(pady=15)
 
-btn_main_logout = tk.Button(main_menu_frame, text="Logout", font=("Arial", 14), 
+btn_face_recognition_section = tk.Button(main_menu_frame, text="Face Recognition", font=("Arial", 14),
+                                        command=show_face_recognition_section, bg='#9C27B0', fg='white', width=25, height=2)
+btn_face_recognition_section.pack(pady=15)
+
+btn_main_logout = tk.Button(main_menu_frame, text="Logout", font=("Arial", 14),
                            command=go_back_to_login, bg='#f44336', fg='white', width=15)
 btn_main_logout.pack(pady=30)
 
@@ -1420,6 +1596,9 @@ sec_buttons_frame.pack(pady=20)
 btn_enroll_folder = tk.Button(sec_buttons_frame, text="Enroll From Folder", font=("Arial", 12), command=enroll_from_folder_ui, bg='#4CAF50', fg='white')
 btn_enroll_folder.pack(side='left', padx=8)
 
+btn_enroll_image = tk.Button(sec_buttons_frame, text="Enroll From Image", font=("Arial", 12), command=enroll_from_image_ui, bg='#36A2EB', fg='white')
+btn_enroll_image.pack(side='left', padx=8)
+
 btn_enroll_camera = tk.Button(sec_buttons_frame, text="Enroll From Camera", font=("Arial", 12), command=lambda: enroll_from_camera_ui(), bg='#3EA055', fg='white')
 btn_enroll_camera.pack(side='left', padx=8)
 
@@ -1466,6 +1645,25 @@ lbl_sec_status.pack(pady=(4,0))
 
 btn_sec_back = tk.Button(security_frame, text="Back to Menu", font=("Arial", 14), command=go_back_to_main_menu, bg='#FFA500', fg='white')
 btn_sec_back.pack(pady=20)
+
+# Face recognition UI
+face_recognition_frame = tk.Frame(root, bg='#f2f2f2')
+
+lbl_face_rec_title = tk.Label(face_recognition_frame, text="Face Recognition", font=("Arial", 24), bg='#f2f2f2', fg='#333')
+lbl_face_rec_title.pack(pady=20)
+
+lbl_face_rec_description = tk.Label(face_recognition_frame, text="Currently recognized individuals with their best accuracy scores.\n\nTo enroll people: Go to Security Management > Load Authorized,\nor place photos in 'authorized/Name/' folders and restart the app.", font=("Arial", 12), bg='#f2f2f2', fg='#666', justify="center")
+lbl_face_rec_description.pack(pady=10)
+
+# Video display for face recognition
+lbl_face_video = tk.Label(face_recognition_frame, bg='#ddd')
+lbl_face_video.pack(pady=20)
+
+recognized_listbox = tk.Listbox(face_recognition_frame, font=("Arial", 14), width=50, height=10)
+recognized_listbox.pack(pady=20)
+
+btn_face_rec_back = tk.Button(face_recognition_frame, text="Back to Menu", font=("Arial", 14), command=go_back_to_main_menu, bg='#FFA500', fg='white')
+btn_face_rec_back.pack(pady=20)
 
 # Initially show the login frame
 login_frame.pack()
